@@ -1,8 +1,11 @@
-"""LangGraph assembly for the investigation path (PIPELINE.md #1-4;
-ARCHITECTURE.md flowchart nodes A->B->{C,D,E}->F).
+"""LangGraph assembly for the investigation + hypothesis-loop path
+(PIPELINE.md #1-6; ARCHITECTURE.md flowchart nodes A->B->{C,D,E}->F->G->H).
 
-The hypothesis loop and everything downstream (Phase 2+) extend this graph
-later; for now it ends at the Evidence Collector.
+Everything downstream of the hypothesis loop (Phase 3+: memory retrieval,
+fix/patch/test, human gate) extends this graph later; for now it ends at
+either the accepted-hypothesis handoff (status "retrieving_memory") or the
+bounded-loop escalation (status "awaiting_human_approval") — see
+DECISIONS.md D-015/D-016 for what's deferred here.
 """
 
 from __future__ import annotations
@@ -11,6 +14,8 @@ from langgraph.graph import END, StateGraph
 
 from app.agents.deploy_agent import deploy_agent_node
 from app.agents.evidence_collector import evidence_collector_node
+from app.agents.hypothesis_generator import hypothesis_generator_node
+from app.agents.hypothesis_validator import hypothesis_validator_node
 from app.agents.log_agent import log_agent_node
 from app.agents.metrics_agent import metrics_agent_node
 from app.agents.supervisor import supervisor_node
@@ -22,6 +27,14 @@ def route_after_supervisor(state: IncidentState) -> list[str]:
     return state.agents_dispatched
 
 
+def route_after_validation(state: IncidentState) -> str:
+    """Loop back to the generator while still investigating; otherwise the
+    hypothesis loop has ended (accepted or escalated) and the graph stops
+    here until later phases extend it further.
+    """
+    return "hypothesis_generator" if state.status == "validating_hypothesis" else END
+
+
 def build_graph():
     graph = StateGraph(IncidentState)
 
@@ -30,6 +43,8 @@ def build_graph():
     graph.add_node("metrics_agent", metrics_agent_node)
     graph.add_node("deploy_agent", deploy_agent_node)
     graph.add_node("evidence_collector", evidence_collector_node)
+    graph.add_node("hypothesis_generator", hypothesis_generator_node)
+    graph.add_node("hypothesis_validator", hypothesis_validator_node)
 
     graph.set_entry_point("supervisor")
     graph.add_conditional_edges(
@@ -40,6 +55,12 @@ def build_graph():
     graph.add_edge("log_agent", "evidence_collector")
     graph.add_edge("metrics_agent", "evidence_collector")
     graph.add_edge("deploy_agent", "evidence_collector")
-    graph.add_edge("evidence_collector", END)
+    graph.add_edge("evidence_collector", "hypothesis_generator")
+    graph.add_edge("hypothesis_generator", "hypothesis_validator")
+    graph.add_conditional_edges(
+        "hypothesis_validator",
+        route_after_validation,
+        ["hypothesis_generator", END],
+    )
 
     return graph.compile()
