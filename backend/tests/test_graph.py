@@ -68,6 +68,26 @@ def _patched_accepting_llms():
     )
 
 
+_STUB_SIMILAR_INCIDENT_ROW = {
+    "incident_id": "inc-14",
+    "service_name": "payments",
+    "alert_type": "unknown",
+    "accepted_hypothesis": "Redis connection pool exhausted",
+    "fix_applied": "Increased Redis connection pool size",
+    "recovery_time_minutes": 18.0,
+    "postmortem_link": None,
+    "resolved_at": datetime.now(timezone.utc),
+    "similarity_score": 0.92,
+}
+
+
+def _patched_incident_memory():
+    return (
+        patch("app.agents.incident_memory.get_embedder", return_value=lambda text: [0.1, 0.2, 0.3]),
+        patch("app.agents.incident_memory.query_similar_incidents", return_value=[_STUB_SIMILAR_INCIDENT_ROW]),
+    )
+
+
 def _patched_rejecting_llms():
     generator_llm = _StubLLM(_HypothesisCandidates(hypotheses=[_HypothesisCandidate(description="Redis pool exhausted")]))
     validator_llm = _StubLLM(_ValidationVerdict(status="rejected", rejection_reason="No supporting metric"))
@@ -81,25 +101,28 @@ def test_full_investigation_merges_evidence_and_accepts_a_hypothesis():
     graph = build_graph()
     p1, p2, p3, p4 = _patched_tools()
     p5, p6 = _patched_accepting_llms()
-    with p1, p2, p3, p4, p5, p6:
+    p7, p8 = _patched_incident_memory()
+    with p1, p2, p3, p4, p5, p6, p7, p8:
         result = graph.invoke(_stub_state())
 
     assert sorted(e.source for e in result["evidence"]) == ["deploy", "logs", "metrics"]
     assert set(result["agents_dispatched"]) == {"log_agent", "metrics_agent", "deploy_agent"}
-    assert result["status"] == "retrieving_memory"
+    assert result["status"] == "planning_fix"
     assert result["accepted_hypothesis"].description == "Redis pool exhausted"
+    assert result["similar_incidents"][0].incident_id == "inc-14"
 
 
 def test_conditional_fan_out_dispatches_only_requested_agent():
     graph = build_graph()
     p1, p2, p3, p4 = _patched_tools()
     p5, p6 = _patched_accepting_llms()
-    with p1, p2, p3, p4, p5, p6:
+    p7, p8 = _patched_incident_memory()
+    with p1, p2, p3, p4, p5, p6, p7, p8:
         result = graph.invoke(_stub_state(alert_payload={"relevant_agents": ["log_agent"]}))
 
     assert result["agents_dispatched"] == ["log_agent"]
     assert [e.source for e in result["evidence"]] == ["logs"]
-    assert result["status"] == "retrieving_memory"
+    assert result["status"] == "planning_fix"
 
 
 def test_hypothesis_loop_escalates_to_human_review_at_max_iterations():
