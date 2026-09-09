@@ -32,6 +32,12 @@ def query_similar_incidents(
 ) -> list[dict]:
     """Pre-filter by service/alert-type, then rank by cosine distance
     (DECISIONS.md D-019 — Option C hybrid retrieval).
+
+    The `::vector` casts are required, not cosmetic: psycopg sends a Python
+    list of floats as `double precision[]`, and pgvector only registers an
+    *assignment* cast from that to `vector`. Assignment casts apply to INSERT
+    targets but not to operator resolution, so `<=>` fails without an explicit
+    cast even though `insert_incident` below works fine without one.
     """
     conn = conn or _default_conn()
     with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
@@ -39,10 +45,10 @@ def query_similar_incidents(
             """
             SELECT incident_id, service_name, alert_type, accepted_hypothesis,
                    fix_applied, recovery_time_minutes, postmortem_link, resolved_at,
-                   1 - (evidence_summary_embedding <=> %(embedding)s) AS similarity_score
+                   1 - (evidence_summary_embedding <=> %(embedding)s::vector) AS similarity_score
             FROM incidents
             WHERE service_name = %(service_name)s OR alert_type = %(alert_type)s
-            ORDER BY evidence_summary_embedding <=> %(embedding)s
+            ORDER BY evidence_summary_embedding <=> %(embedding)s::vector
             LIMIT %(top_n)s
             """,
             {
