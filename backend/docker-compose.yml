@@ -5,6 +5,10 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      # Overrides .env's host-facing value: inside the Compose network Postgres
+      # is reachable as `postgres`, not `localhost` (DECISIONS.md D-023).
+      DATABASE_URL: postgresql://copilot:copilot@postgres:5432/copilot
     depends_on:
       postgres:
         condition: service_healthy
