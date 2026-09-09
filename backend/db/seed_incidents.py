@@ -1,13 +1,15 @@
 """Seeds the Vector DB with synthetic historical incidents so the "similar
 incident" retrieval has something real to find (DEMO_ENVIRONMENT.md §5,
-INCIDENT_MEMORY.md §7). Not imported by app code; run manually once Postgres
-is up:
+INCIDENT_MEMORY.md §7). Not imported by app code; run manually from `backend/`
+once Postgres is up:
 
-    python -m backend.db.seed_incidents
+    docker compose up -d postgres
+    python -m db.seed_incidents
 
-Not executed against a live database as part of this commit — Docker wasn't
-running when this was written (IMPLEMENTATION_CHECKLIST.md Phase 3 notes this
-as an open follow-up, not a claimed-verified seed).
+Idempotent (`ON CONFLICT DO NOTHING`), so re-running is safe. Reads
+DATABASE_URL from `.env`, which points at localhost — the Compose network's
+`postgres` hostname is injected only for the containerized backend
+(DECISIONS.md D-023).
 """
 
 from __future__ import annotations
