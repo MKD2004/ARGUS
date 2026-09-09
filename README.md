@@ -52,8 +52,33 @@ npm install
 npm run dev
 ```
 
+Seed the incident memory store, so similarity retrieval has history to match against:
+
+```bash
+cd backend
+python -m db.seed_incidents   # idempotent
+```
+
 Backend health check: `http://localhost:8000/health`. Demo stack services are on `8001`–`8004`, Prometheus on `9090`, Grafana on `3000`, Loki on `3100`.
+
+Start an investigation:
+
+```bash
+curl -X POST http://localhost:8000/incidents   -H 'Content-Type: application/json'   -d '{"service_name": "payments", "alert_type": "high_latency"}'
+```
+
+The response is the final incident state — evidence gathered, hypotheses considered and rejected with reasons, the accepted hypothesis, and any similar past incidents.
+
+## Tests
+
+```bash
+cd backend
+pytest                      # tests needing Postgres skip themselves if it's down
+pytest -m "not integration" # skip them explicitly
+```
 
 ## Status
 
-Early build — foundations (repo scaffolding, typed state contract, both Docker Compose stacks) are in place; the agent graph itself is under active development.
+In progress. The investigation half of the pipeline is built and tested end to end: alert ingress, parallel Log/Metrics/Deploy evidence gathering, the bounded hypothesis generate/validate loop, and incident-memory retrieval against pgvector.
+
+Not built yet: fix planning, patch generation, the test/retry loop, the human approval gate, GitHub/Slack output, the dashboard, and the demo environment's fault-injection scenarios (the demo services are currently health-check stubs).
