@@ -14,7 +14,7 @@ from functools import lru_cache
 
 from fastapi import FastAPI
 
-from app.graph import build_graph
+from app.graph import build_graph, recursion_limit_for
 from app.models.alert import AlertRequest
 from app.models.state import IncidentState
 
@@ -53,5 +53,5 @@ def create_incident(alert: AlertRequest) -> IncidentState:
     logger.info(
         "Ingress: starting investigation %s for service %s", state.incident_id, state.service_name
     )
-    result = _graph().invoke(state)
+    result = _graph().invoke(state, config={"recursion_limit": recursion_limit_for(state)})
     return IncidentState(**result)
