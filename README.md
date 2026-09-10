@@ -77,8 +77,12 @@ pytest                      # tests needing Postgres skip themselves if it's dow
 pytest -m "not integration" # skip them explicitly
 ```
 
+The sandbox runner tests run real `git`, `ruff`, and `pytest` subprocesses, so they need `git` on PATH (they skip without it).
+
 ## Status
 
-In progress. The investigation half of the pipeline is built and tested end to end: alert ingress, parallel Log/Metrics/Deploy evidence gathering, the bounded hypothesis generate/validate loop, and incident-memory retrieval against pgvector.
+In progress. Built and tested: alert ingress, parallel Log/Metrics/Deploy evidence gathering, the bounded hypothesis generate/validate loop, incident-memory retrieval against pgvector, and the fix loop: fix planning, patch generation as a reviewable diff, and a bounded patch/test retry cycle. Every run currently stops at "awaiting human approval".
 
-Not built yet: fix planning, patch generation, the test/retry loop, the human approval gate, GitHub/Slack output, the dashboard, and the demo environment's fault-injection scenarios (the demo services are currently health-check stubs).
+Generated patches are tested in a throwaway copy of the service with `git apply`, `ruff`, and `pytest`, so the real code is never touched. That is isolation, not a security sandbox: the patched code runs as the backend's own OS user, with secrets removed from its environment. A container-based runner is planned.
+
+Not built yet: the human approval gate, GitHub/Slack output, postmortems, the dashboard, and the demo environment's fault-injection scenarios. The demo services are currently health-check stubs with no tests, so a real patch against them cannot pass yet.
