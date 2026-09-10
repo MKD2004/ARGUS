@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from app.graph import recursion_limit_for
 from app.main import _graph, app
 from app.models.alert import AlertRequest
 from app.models.state import IncidentState
@@ -26,9 +27,11 @@ def _echo_graph():
     class _Graph:
         def __init__(self):
             self.seen: IncidentState | None = None
+            self.config: dict | None = None
 
-        def invoke(self, state: IncidentState):
+        def invoke(self, state: IncidentState, config=None):
             self.seen = state
+            self.config = config
             return state.model_dump()
 
     return _Graph()
@@ -53,6 +56,8 @@ def test_post_incident_runs_the_graph_and_returns_final_state():
     assert body["alert_payload"]["alert_type"] == "high_latency"
     assert body["status"] == "investigating"
     assert graph.seen is not None, "graph was never invoked"
+    # The step limit must come from the incident's own loop bounds (D-031).
+    assert graph.config == {"recursion_limit": recursion_limit_for(graph.seen)}
 
 
 def test_incident_id_is_generated_when_not_supplied():
