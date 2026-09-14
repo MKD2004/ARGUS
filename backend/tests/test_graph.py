@@ -7,6 +7,7 @@ the Loki/Prometheus/GitHub tool calls are — no live Anthropic API calls and
 no subprocesses happen here.
 """
 
+import re
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -68,9 +69,22 @@ def _patched_tools():
     )
 
 
+class _AcceptingValidatorLLM:
+    """Accepts every hypothesis, citing the first evidence id in the prompt.
+
+    Evidence ids are random (`ev-logs-<hex>`), and the validator ignores ids
+    that don't exist in the incident (D-036), so a fixed id like "ev-1" would
+    leave the hypothesis with no real support and get it rejected.
+    """
+
+    def invoke(self, prompt):
+        first_id = re.search(r"\[(ev-[^\]]+)\]", prompt).group(1)
+        return _ValidationVerdict(status="accepted", supporting_evidence_ids=[first_id])
+
+
 def _patched_accepting_llms():
     generator_llm = _StubLLM(_HypothesisCandidates(hypotheses=[_HypothesisCandidate(description="Redis pool exhausted")]))
-    validator_llm = _StubLLM(_ValidationVerdict(status="accepted", supporting_evidence_ids=["ev-1"]))
+    validator_llm = _AcceptingValidatorLLM()
     return (
         patch("app.agents.hypothesis_generator.get_structured_llm", return_value=generator_llm),
         patch("app.agents.hypothesis_validator.get_structured_llm", return_value=validator_llm),
@@ -174,6 +188,10 @@ def test_conditional_fan_out_dispatches_only_requested_agent():
     assert result["agents_dispatched"] == ["log_agent"]
     assert [e.source for e in result["evidence"]] == ["logs"]
     assert result["status"] == "awaiting_human_approval"
+    # "awaiting_human_approval" is also where an unresolved diagnosis ends, so
+    # the status alone doesn't prove the run got through; check what it produced.
+    assert result["accepted_hypothesis"].supporting_evidence_ids == [result["evidence"][0].id]
+    assert [p.test_result for p in result["patches"]] == ["passed"]
 
 
 class _NewHypothesisEachCallLLM:
