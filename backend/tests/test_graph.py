@@ -176,6 +176,19 @@ def test_conditional_fan_out_dispatches_only_requested_agent():
     assert result["status"] == "awaiting_human_approval"
 
 
+class _NewHypothesisEachCallLLM:
+    """A generator stub that proposes a different hypothesis on every call, so
+    the generator never runs out of ideas and only the loop bound can end the run.
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    def invoke(self, prompt):
+        self.calls += 1
+        return _HypothesisCandidates(hypotheses=[_HypothesisCandidate(description=f"Cause number {self.calls}")])
+
+
 def test_hypothesis_loop_escalates_to_human_review_at_max_iterations():
     """Forces every candidate to be rejected, proving the graph's conditional
     edge actually exits the generator<->validator cycle (not an infinite loop)
@@ -183,21 +196,65 @@ def test_hypothesis_loop_escalates_to_human_review_at_max_iterations():
     (TESTING_STRATEGY.md #4).
     """
     graph = build_graph()
+    generator_llm = _NewHypothesisEachCallLLM()
+    validator_llm = _StubLLM(_ValidationVerdict(status="rejected", rejection_reason="No supporting metric"))
+    p1, p2, p3, p4 = _patched_tools()
+    with (
+        p1, p2, p3, p4,
+        patch("app.agents.hypothesis_generator.get_structured_llm", return_value=generator_llm),
+        patch("app.agents.hypothesis_validator.get_structured_llm", return_value=validator_llm),
+    ):
+        result = graph.invoke(_stub_state(max_hypothesis_iterations=3))
+
+    assert result["status"] == "awaiting_human_approval"
+    assert result["hypothesis_loop_iterations"] == 3
+    assert generator_llm.calls == 3
+    assert result.get("accepted_hypothesis") is None
+    assert [h.description for h in result["rejected_hypotheses"]] == [
+        "Cause number 1",
+        "Cause number 2",
+        "Cause number 3",
+    ]
+    # An unresolved diagnosis never reaches fix generation (PIPELINE.md §6).
+    assert result.get("patches", []) == []
+
+
+def test_hypothesis_loop_ends_early_when_the_generator_repeats_itself():
+    """D-034: round 2 proposes only the hypothesis round 1 rejected. The
+    generator filters it out (D-016), and with nothing new to test the loop
+    ends then, without spending its remaining rounds.
+    """
+    graph = build_graph()
     p1, p2, p3, p4 = _patched_tools()
     p5, p6 = _patched_rejecting_llms()
     with p1, p2, p3, p4, p5, p6:
-        result = graph.invoke(_stub_state(max_hypothesis_iterations=2))
+        result = graph.invoke(_stub_state(max_hypothesis_iterations=5))
 
     assert result["status"] == "awaiting_human_approval"
-    assert result["hypothesis_loop_iterations"] == 2
-    assert result.get("accepted_hypothesis") is None
-    # Only 1, not 2: round 2's generator call structurally filters out the
-    # already-rejected "Redis pool exhausted" description before the
-    # validator ever sees it again (DECISIONS.md D-016) — the loop still
-    # burns its second iteration and correctly escalates on an empty round.
-    assert len(result["rejected_hypotheses"]) == 1
-    # An unresolved diagnosis never reaches fix generation (PIPELINE.md §6).
+    assert result["hypothesis_loop_iterations"] == 1
+    assert [h.description for h in result["rejected_hypotheses"]] == ["Redis pool exhausted"]
     assert result.get("patches", []) == []
+
+
+def test_no_evidence_goes_to_human_review_without_validating_anything():
+    """The first live run (Phase 3.5) had no evidence and spent all its rounds
+    anyway. Now it ends after the first generator step, and no validator call happens.
+    """
+    graph = build_graph()
+    validator_llm = _StubLLM(_ValidationVerdict(status="accepted"))
+    with (
+        patch("app.agents.log_agent.query_logs", return_value=[]),
+        patch("app.agents.metrics_agent.query_metrics", return_value=[]),
+        patch("app.agents.deploy_agent.query_deploys", return_value=[]),
+        patch("app.agents.deploy_agent.GITHUB_REPO", "org/repo"),
+        patch("app.agents.hypothesis_validator.get_structured_llm", return_value=validator_llm),
+    ):
+        result = graph.invoke(_stub_state(max_hypothesis_iterations=3))
+
+    assert result["status"] == "awaiting_human_approval"
+    assert result["evidence"] == []
+    assert result["hypothesis_loop_iterations"] == 0
+    assert validator_llm.prompts == []
 
 
 def test_patch_loop_escalates_to_human_review_at_max_patch_retries():
