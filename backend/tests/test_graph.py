@@ -18,7 +18,7 @@ from app.agents.fix_planner import _FixStrategyCandidate, _FixStrategyCandidates
 from app.agents.hypothesis_generator import _HypothesisCandidate, _HypothesisCandidates
 from app.agents.hypothesis_validator import _ValidationVerdict
 from app.agents.patch_generator import _FileEdit, _PatchEdits
-from app.graph import build_graph, recursion_limit_for
+from app.graph import build_graph, recursion_limit_for, run_config
 from app.models.state import IncidentState
 from app.tools.sandbox_runner import SandboxResult
 
@@ -45,6 +45,11 @@ class _StubLLM:
     def invoke(self, prompt):
         self.prompts.append(prompt)
         return self.response
+
+
+def _run_to_gate(graph, state: IncidentState) -> dict:
+    """Runs until the graph pauses before the human gate (D-037)."""
+    return graph.invoke(state, config=run_config(state))
 
 
 def _patched_tools():
@@ -160,7 +165,7 @@ def test_full_run_accepts_a_hypothesis_and_produces_a_passing_patch():
     p7, p8 = _patched_incident_memory()
     (p9, p10, p11, p12), _ = _patched_fix_loop([_PASS])
     with p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12:
-        result = graph.invoke(_stub_state())
+        result = _run_to_gate(graph, _stub_state())
 
     assert sorted(e.source for e in result["evidence"]) == ["deploy", "logs", "metrics"]
     assert set(result["agents_dispatched"]) == {"log_agent", "metrics_agent", "deploy_agent"}
@@ -171,7 +176,7 @@ def test_full_run_accepts_a_hypothesis_and_produces_a_passing_patch():
     assert "+POOL_SIZE = 50" in result["patches"][0].diff
     assert result["patch_retry_count"] == 0
     assert result["status"] == "awaiting_human_approval"
-    # Phase 4 stops at the gate: nothing downstream of human approval has run.
+    # The run pauses before the human gate: nothing downstream of approval has run.
     assert result.get("github_pr_url") is None
     assert result.get("human_decision") is None
 
@@ -183,7 +188,7 @@ def test_conditional_fan_out_dispatches_only_requested_agent():
     p7, p8 = _patched_incident_memory()
     (p9, p10, p11, p12), _ = _patched_fix_loop([_PASS])
     with p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12:
-        result = graph.invoke(_stub_state(alert_payload={"relevant_agents": ["log_agent"]}))
+        result = _run_to_gate(graph, _stub_state(alert_payload={"relevant_agents": ["log_agent"]}))
 
     assert result["agents_dispatched"] == ["log_agent"]
     assert [e.source for e in result["evidence"]] == ["logs"]
@@ -222,7 +227,7 @@ def test_hypothesis_loop_escalates_to_human_review_at_max_iterations():
         patch("app.agents.hypothesis_generator.get_structured_llm", return_value=generator_llm),
         patch("app.agents.hypothesis_validator.get_structured_llm", return_value=validator_llm),
     ):
-        result = graph.invoke(_stub_state(max_hypothesis_iterations=3))
+        result = _run_to_gate(graph, _stub_state(max_hypothesis_iterations=3))
 
     assert result["status"] == "awaiting_human_approval"
     assert result["hypothesis_loop_iterations"] == 3
@@ -246,7 +251,7 @@ def test_hypothesis_loop_ends_early_when_the_generator_repeats_itself():
     p1, p2, p3, p4 = _patched_tools()
     p5, p6 = _patched_rejecting_llms()
     with p1, p2, p3, p4, p5, p6:
-        result = graph.invoke(_stub_state(max_hypothesis_iterations=5))
+        result = _run_to_gate(graph, _stub_state(max_hypothesis_iterations=5))
 
     assert result["status"] == "awaiting_human_approval"
     assert result["hypothesis_loop_iterations"] == 1
@@ -267,7 +272,7 @@ def test_no_evidence_goes_to_human_review_without_validating_anything():
         patch("app.agents.deploy_agent.GITHUB_REPO", "org/repo"),
         patch("app.agents.hypothesis_validator.get_structured_llm", return_value=validator_llm),
     ):
-        result = graph.invoke(_stub_state(max_hypothesis_iterations=3))
+        result = _run_to_gate(graph, _stub_state(max_hypothesis_iterations=3))
 
     assert result["status"] == "awaiting_human_approval"
     assert result["evidence"] == []
@@ -285,7 +290,7 @@ def test_patch_loop_escalates_to_human_review_at_max_patch_retries():
     p7, p8 = _patched_incident_memory()
     (p9, p10, p11, p12), _ = _patched_fix_loop([_fail()] * 3)
     with p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12:
-        result = graph.invoke(_stub_state(max_patch_retries=3))
+        result = _run_to_gate(graph, _stub_state(max_patch_retries=3))
 
     assert result["status"] == "awaiting_human_approval"
     assert result["patch_retry_count"] == 3
@@ -303,7 +308,7 @@ def test_patch_loop_feeds_the_failure_back_and_recovers():
     p7, p8 = _patched_incident_memory()
     (p9, p10, p11, p12), patch_llm = _patched_fix_loop([_fail("[pytest] AssertionError: timeout too short"), _PASS])
     with p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12:
-        result = graph.invoke(_stub_state())
+        result = _run_to_gate(graph, _stub_state())
 
     assert [p.test_result for p in result["patches"]] == ["failed", "passed"]
     assert result["patch_retry_count"] == 1
@@ -327,7 +332,7 @@ def test_step_limit_scales_with_the_loop_bounds():
         p7, p8 = _patched_incident_memory()
         (p9, p10, p11, p12), _ = _patched_fix_loop([_fail()] * 12)
         with p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12:
-            return graph.invoke(state, config=config)
+            return graph.invoke(state, config={"configurable": {"thread_id": state.incident_id}, **(config or {})})
 
     with pytest.raises(GraphRecursionError):
         run()
