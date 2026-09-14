@@ -27,3 +27,15 @@ TARGET_REPO_PATH = Path(os.environ.get("TARGET_REPO_PATH") or _REPO_ROOT / "demo
 
 # Per-step timeout for git apply / ruff / pytest in the Test Execution Agent (D-028).
 TEST_EXECUTION_TIMEOUT_SECONDS = float(os.environ.get("TEST_EXECUTION_TIMEOUT_SECONDS", "120"))
+
+# PR and issue output (DECISIONS.md D-041). Diff paths are relative to
+# TARGET_REPO_PATH; this prefix maps them onto paths inside GITHUB_REPO.
+GITHUB_PATCH_PATH_PREFIX = os.environ.get("GITHUB_PATCH_PATH_PREFIX", "demo-env/services").strip("/")
+# CLAUDE.md §0: automation commits on this project are authored as the owner.
+# Unset means GitHub attributes the commit to the token's user.
+GITHUB_COMMIT_AUTHOR_NAME = os.environ.get("GITHUB_COMMIT_AUTHOR_NAME") or None
+GITHUB_COMMIT_AUTHOR_EMAIL = os.environ.get("GITHUB_COMMIT_AUTHOR_EMAIL") or None
+
+# Slack notifications (D-042). Both must be set, or the notifier skips.
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN") or None
+SLACK_CHANNEL = os.environ.get("SLACK_CHANNEL") or None
