@@ -19,6 +19,7 @@ from app.models.state import Hypothesis, IncidentState
 logger = logging.getLogger(__name__)
 
 DEFAULT_REJECTION_REASON = "Not supported by available evidence"
+UNVALIDATED_REASON_PREFIX = "Could not be validated"
 
 
 class _ValidationVerdict(BaseModel):
@@ -50,11 +51,24 @@ def hypothesis_validator_node(state: IncidentState, llm=None) -> dict:
     for hypothesis in state.candidate_hypotheses:
         try:
             verdict = llm.invoke(_build_prompt(hypothesis, state))
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "Hypothesis Validator: LLM call failed for hypothesis %s (incident %s)",
                 hypothesis.id,
                 state.incident_id,
+            )
+            # Recorded, never silently dropped, so the trace shows it was
+            # considered and why it wasn't checked (D-033).
+            newly_rejected.append(
+                hypothesis.model_copy(
+                    update={
+                        "status": "rejected",
+                        "rejection_reason": (
+                            f"{UNVALIDATED_REASON_PREFIX}: the validator's model call failed "
+                            f"({exc.__class__.__name__}). Not ruled out by evidence."
+                        ),
+                    }
+                )
             )
             continue
 
@@ -68,6 +82,8 @@ def hypothesis_validator_node(state: IncidentState, llm=None) -> dict:
             )
             return {
                 "accepted_hypothesis": accepted,
+                # Keep this round's earlier rejections too (D-035).
+                "rejected_hypotheses": state.rejected_hypotheses + newly_rejected,
                 "candidate_hypotheses": [],
                 "status": "retrieving_memory",
                 "hypothesis_loop_iterations": state.hypothesis_loop_iterations + 1,
