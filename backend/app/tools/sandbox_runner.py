@@ -9,9 +9,6 @@ process's OS user. Read D-028 before pointing it at anything untrusted.
 from __future__ import annotations
 
 import logging
-import os
-import re
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -19,22 +16,13 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from app.config import TARGET_REPO_PATH, TEST_EXECUTION_TIMEOUT_SECONDS
+from app.tools.patch_apply import changed_paths, git_apply, restricted_env, run_command
 from app.tools.target_repo import SKIP_DIRS, resolve_service_dir
 
 logger = logging.getLogger(__name__)
 
 MAX_OUTPUT_CHARS = 6000
 PYTEST_NO_TESTS_COLLECTED = 5
-
-# Only what a subprocess needs to find executables and a temp directory.
-# Everything else (API keys, tokens, DATABASE_URL) is deliberately withheld
-# from code a model wrote.
-_ENV_ALLOWLIST = {
-    "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC",
-    "TEMP", "TMP", "TMPDIR", "HOME", "USERPROFILE", "LANG", "LC_ALL",
-}
-
-_CHANGED_FILE = re.compile(r"^\+\+\+ b/(.+)$", re.MULTILINE)
 
 
 class SandboxResult(BaseModel):
@@ -47,34 +35,6 @@ def _tail(text: str) -> str:
     if len(text) <= MAX_OUTPUT_CHARS:
         return text
     return "...(earlier output truncated)\n" + text[-MAX_OUTPUT_CHARS:]
-
-
-def _sandbox_env(workdir: Path) -> dict[str, str]:
-    env = {key: value for key, value in os.environ.items() if key.upper() in _ENV_ALLOWLIST}
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    # Stop git searching parent directories for a repository: inside one,
-    # `git apply` resolves paths from that repo's root, not from the copy.
-    env["GIT_CEILING_DIRECTORIES"] = str(workdir.parent)
-    return env
-
-
-def _run(cmd: list[str], cwd: Path, env: dict[str, str], timeout: float) -> tuple[int, str]:
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return -1, f"timed out after {timeout:g}s"
-    except FileNotFoundError as exc:
-        return -1, f"could not start {cmd[0]}: {exc}"
-    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
 def _copy_with_lf_endings(src: Path, dest: Path) -> None:
@@ -120,22 +80,15 @@ def run_patch_in_sandbox(
     with tempfile.TemporaryDirectory(prefix="argus-sandbox-", ignore_cleanup_errors=True) as tmp:
         workdir = Path(tmp)
         _copy_with_lf_endings(service_dir, workdir / service_rel)
-        env = _sandbox_env(workdir)
+        env = restricted_env(workdir)
 
-        # Handed to git as a file written in binary mode. Piping the diff through
-        # text-mode stdin instead would, on Windows, turn every LF into CRLF on
-        # the way in, and then no hunk would match the LF copy.
-        patch_file = workdir / "argus.patch"
-        patch_file.write_bytes(diff.encode("utf-8"))
-        code, out = _run(["git", "apply", "--check", patch_file.name], workdir, env, timeout)
-        if code == 0:
-            code, out = _run(["git", "apply", patch_file.name], workdir, env, timeout)
-        if code != 0:
+        applied, out = git_apply(diff, workdir, env, timeout)
+        if not applied:
             return SandboxResult(passed=False, output=_tail(f"[git apply] the diff does not apply cleanly:\n{out}"))
 
-        changed_py = [p for p in _CHANGED_FILE.findall(diff) if p.endswith(".py") and (workdir / p).is_file()]
+        changed_py = [p for p in changed_paths(diff) if p.endswith(".py") and (workdir / p).is_file()]
         if changed_py:
-            code, out = _run(
+            code, out = run_command(
                 [sys.executable, "-m", "ruff", "check", "--isolated", "--no-cache",
                  "--select", "F", "--output-format", "concise", *changed_py],
                 workdir, env, timeout,
@@ -143,7 +96,7 @@ def run_patch_in_sandbox(
             if code != 0:
                 return SandboxResult(passed=False, output=_tail(f"[ruff] lint failed on the changed files:\n{out}"))
 
-        code, out = _run(
+        code, out = run_command(
             [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
             workdir / service_rel, env, timeout,
         )
