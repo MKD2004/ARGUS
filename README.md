@@ -61,13 +61,21 @@ python -m db.seed_incidents   # idempotent
 
 Backend health check: `http://localhost:8000/health`. Demo stack services are on `8001`–`8004`, Prometheus on `9090`, Grafana on `3000`, Loki on `3100`.
 
-Start an investigation:
+### The dashboard
+
+Open `http://localhost:5173`. In development the Vite server forwards `/api` and `/ws` to the backend on port 8000 (set `ARGUS_BACKEND_URL` to point elsewhere). Pick a scenario and click **Inject failure**. The pipeline, evidence, hypotheses, and patch attempts update live, and when the run pauses you approve or reject from the page. For now "Inject failure" raises the scenario's alert but doesn't break anything in the demo stack; that's Phase 7.
+
+### The API directly
+
+Start an investigation. It returns `202` straight away and runs in the background:
 
 ```bash
-curl -X POST http://localhost:8000/incidents   -H 'Content-Type: application/json'   -d '{"service_name": "payments", "alert_type": "high_latency"}'
+curl -X POST http://localhost:8000/incidents \
+  -H 'Content-Type: application/json' \
+  -d '{"service_name": "payments", "alert_type": "high_latency"}'
 ```
 
-The response is the incident state at the point the run pauses for a human: evidence gathered, hypotheses considered and rejected with reasons, the accepted hypothesis, similar past incidents, and patch attempts. Review it with `GET /incidents/<incident_id>`, then decide:
+Follow progress over `ws://localhost:8000/ws/incidents/<incident_id>`: every event carries the full incident state, and a new connection replays everything so far. Or poll `GET /incidents/<incident_id>`. When the run pauses for a human, `GET /incidents/<incident_id>/approval` says whether approval is allowed and why. Then decide:
 
 ```bash
 curl -X POST http://localhost:8000/incidents/<incident_id>/decision \
@@ -83,16 +91,21 @@ curl -X POST http://localhost:8000/incidents/<incident_id>/decision \
 cd backend
 pytest                      # tests needing Postgres skip themselves if it's down
 pytest -m "not integration" # skip them explicitly
+
+cd frontend
+npm test                    # dashboard view logic, Node's built-in test runner
 ```
 
 The sandbox runner tests run real `git`, `ruff`, and `pytest` subprocesses, so they need `git` on PATH (they skip without it).
 
 ## Status
 
-In progress. Built and tested end to end: alert ingress, parallel Log/Metrics/Deploy evidence gathering, the bounded hypothesis generate/validate loop, incident-memory retrieval against pgvector, the fix loop (fix planning, patch generation as a reviewable diff, a bounded patch/test retry cycle), and the human approval gate.
+In progress. Built and tested end to end: alert ingress, parallel Log/Metrics/Deploy evidence gathering, the bounded hypothesis generate/validate loop, incident-memory retrieval against pgvector, the fix loop (fix planning, patch generation as a reviewable diff, a bounded patch/test retry cycle), the human approval gate, and a live dashboard.
 
 A run pauses for a human decision. Approval is only possible when there is an accepted root cause and the latest patch passed its tests, and that rule is checked in four places before anything reaches GitHub. After the decision, Argus opens a PR (approved) or an issue (rejected), writes a postmortem from the recorded evidence and posts it there, sends a Slack summary, and stores the incident for future similarity matches. The GitHub and Slack steps are tested against fakes and have not yet run against the real services.
 
 Generated patches are tested in a throwaway copy of the service with `git apply`, `ruff`, and `pytest`, so the real code is never touched. That is isolation, not a security sandbox: the patched code runs as the backend's own OS user, with secrets removed from its environment. A container-based runner is planned.
 
-Not built yet: the dashboard (approve/reject is an API call for now), and the demo environment's fault-injection scenarios. The demo services are currently health-check stubs with no tests, so a real patch against them cannot pass yet. Incidents waiting for approval are held in memory and are lost if the backend restarts.
+The dashboard follows each incident over a WebSocket: pipeline progress, the Evidence Engine panel with its reasoning chain, hypotheses ruled out and why, patch attempts with the diff, and the approve/reject decision.
+
+Not built yet: the demo environment's fault injection (the dashboard's "Inject failure" raises the alert but doesn't break anything yet). The demo services are currently health-check stubs with no tests, so a real patch against them cannot pass yet. Incidents and their progress history are held in memory and are lost if the backend restarts.
