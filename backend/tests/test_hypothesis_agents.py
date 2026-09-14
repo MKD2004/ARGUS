@@ -12,6 +12,7 @@ from app.agents.hypothesis_generator import (
     hypothesis_generator_node,
 )
 from app.agents.hypothesis_validator import (
+    NO_REAL_EVIDENCE_REASON,
     UNVALIDATED_REASON_PREFIX,
     _ValidationVerdict,
     hypothesis_validator_node,
@@ -258,3 +259,122 @@ def test_validator_keeps_same_round_rejections_when_accepting():
     assert result["accepted_hypothesis"].id == "hyp-b"
     assert [h.id for h in result["rejected_hypotheses"]] == ["hyp-old", "hyp-a"]
     assert result["rejected_hypotheses"][1].rejection_reason == "CPU stayed flat"
+
+
+# --- Choosing between supported hypotheses (D-036) ---------------------------
+
+
+def _many_evidence(count=4) -> list[Evidence]:
+    return [
+        Evidence(id=f"ev-{n}", source="logs", claim=f"observation {n}", timestamp=datetime.now(timezone.utc))
+        for n in range(1, count + 1)
+    ]
+
+
+class _VerdictPerHypothesisLLM:
+    """Returns the verdict for whichever hypothesis description is in the prompt."""
+
+    def __init__(self, verdicts: dict[str, _ValidationVerdict]):
+        self.verdicts = verdicts
+        self.calls: list[str] = []
+
+    def invoke(self, prompt):
+        for description, verdict in self.verdicts.items():
+            if f'"{description}"' in prompt:
+                self.calls.append(description)
+                return verdict
+        raise AssertionError("prompt named no known hypothesis")
+
+
+def _supported(supporting, contradicting=()) -> _ValidationVerdict:
+    return _ValidationVerdict(
+        status="accepted", supporting_evidence_ids=list(supporting), contradicting_evidence_ids=list(contradicting)
+    )
+
+
+def _round(*descriptions) -> list[Hypothesis]:
+    return [Hypothesis(id=f"hyp-{d[0].lower()}", description=d, status="candidate") for d in descriptions]
+
+
+def _validate(llm, *descriptions):
+    state = _stub_state(evidence=_many_evidence(), candidate_hypotheses=_round(*descriptions))
+    return hypothesis_validator_node(state, llm=llm)
+
+
+def test_validator_checks_every_candidate_before_choosing():
+    llm = _VerdictPerHypothesisLLM({"Alpha": _supported(["ev-1"]), "Beta": _supported(["ev-2"]), "Gamma": _supported(["ev-3"])})
+    result = _validate(llm, "Alpha", "Beta", "Gamma")
+
+    assert llm.calls == ["Alpha", "Beta", "Gamma"]
+    assert result["accepted_hypothesis"].description == "Alpha"
+    assert [h.description for h in result["rejected_hypotheses"]] == ["Beta", "Gamma"]
+
+
+def test_validator_prefers_fewest_contradicting_evidence_over_list_order():
+    llm = _VerdictPerHypothesisLLM(
+        {"Alpha": _supported(["ev-1", "ev-2", "ev-3"], contradicting=["ev-4"]), "Beta": _supported(["ev-1"])}
+    )
+    result = _validate(llm, "Alpha", "Beta")
+
+    assert result["accepted_hypothesis"].description == "Beta"
+    assert result["status"] == "retrieving_memory"
+    alpha = result["rejected_hypotheses"][0]
+    assert alpha.status == "rejected"
+    assert "less strongly than the accepted hypothesis hyp-b" in alpha.rejection_reason
+    # The not-chosen candidate keeps its evidence, so the postmortem can show the comparison.
+    assert alpha.supporting_evidence_ids == ["ev-1", "ev-2", "ev-3"]
+    assert alpha.contradicting_evidence_ids == ["ev-4"]
+
+
+def test_validator_breaks_a_contradiction_tie_by_most_supporting_evidence():
+    llm = _VerdictPerHypothesisLLM({"Alpha": _supported(["ev-1"]), "Beta": _supported(["ev-1", "ev-2"])})
+    result = _validate(llm, "Alpha", "Beta")
+
+    assert result["accepted_hypothesis"].description == "Beta"
+
+
+def test_validator_breaks_a_full_tie_by_list_order_and_says_so():
+    llm = _VerdictPerHypothesisLLM({"Alpha": _supported(["ev-1"]), "Beta": _supported(["ev-2"])})
+    result = _validate(llm, "Alpha", "Beta")
+
+    assert result["accepted_hypothesis"].description == "Alpha"
+    assert "equally with the accepted hypothesis hyp-a" in result["rejected_hypotheses"][0].rejection_reason
+
+
+def test_validator_ignores_made_up_and_repeated_evidence_ids_when_ranking():
+    """Alpha cites 4 ids but only 1 is real and distinct, so Beta's 2 real ids win."""
+    llm = _VerdictPerHypothesisLLM(
+        {"Alpha": _supported(["ev-1", "ev-1", "ev-made-up", "ev-99"]), "Beta": _supported(["ev-1", "ev-2"])}
+    )
+    result = _validate(llm, "Alpha", "Beta")
+
+    assert result["accepted_hypothesis"].description == "Beta"
+    assert result["rejected_hypotheses"][0].supporting_evidence_ids == ["ev-1"]
+
+
+def test_validator_rejects_a_supported_verdict_with_no_real_evidence():
+    llm = _VerdictPerHypothesisLLM({"Alpha": _supported(["ev-made-up"], contradicting=["ev-2", "ev-nope"])})
+    result = _validate(llm, "Alpha")
+
+    assert result.get("accepted_hypothesis") is None
+    assert result["status"] == "validating_hypothesis"
+    rejected = result["rejected_hypotheses"][0]
+    assert rejected.rejection_reason == NO_REAL_EVIDENCE_REASON
+    assert rejected.supporting_evidence_ids == []
+    assert rejected.contradicting_evidence_ids == ["ev-2"]
+
+
+def test_validator_accepts_a_later_candidate_when_earlier_ones_fail_or_are_rejected():
+    class _MixedLLM(_VerdictPerHypothesisLLM):
+        def invoke(self, prompt):
+            if '"Alpha"' in prompt:
+                raise RuntimeError("anthropic down")
+            return super().invoke(prompt)
+
+    llm = _MixedLLM({"Beta": _ValidationVerdict(status="rejected", rejection_reason="CPU flat"), "Gamma": _supported(["ev-3"])})
+    result = _validate(llm, "Alpha", "Beta", "Gamma")
+
+    assert result["accepted_hypothesis"].description == "Gamma"
+    reasons = [h.rejection_reason for h in result["rejected_hypotheses"]]
+    assert reasons[0].startswith(UNVALIDATED_REASON_PREFIX)
+    assert reasons[1] == "CPU flat"
