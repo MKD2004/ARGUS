@@ -1,7 +1,8 @@
 """LangGraph assembly for the pipeline from alert through the fix/test loop
 (PIPELINE.md §1-10; ARCHITECTURE.md flowchart nodes A through M).
 
-For now every run ends at `awaiting_human_approval`, reached one of three ways:
+For now every run ends at `awaiting_human_approval`, reached one of four ways:
+- the Hypothesis Generator had nothing new to test (D-034),
 - the hypothesis loop hit its bound with nothing accepted (D-016),
 - the Fix Planner produced no strategy (D-030), or
 - the patch/test loop finished, with the latest patch passing or out of
@@ -52,6 +53,15 @@ def route_after_supervisor(state: IncidentState) -> list[str]:
     return state.agents_dispatched
 
 
+def route_after_generation(state: IncidentState) -> str:
+    """Skip the validator when the generator had nothing new to test: it has
+    already sent the incident to human review (D-034).
+    """
+    if state.status == "awaiting_human_approval":
+        return END
+    return "hypothesis_validator"
+
+
 def route_after_validation(state: IncidentState) -> str:
     """Loop back to the generator while still investigating; hand off to
     Incident Memory once a hypothesis is accepted; otherwise the loop has
@@ -100,7 +110,11 @@ def build_graph():
     graph.add_edge("metrics_agent", "evidence_collector")
     graph.add_edge("deploy_agent", "evidence_collector")
     graph.add_edge("evidence_collector", "hypothesis_generator")
-    graph.add_edge("hypothesis_generator", "hypothesis_validator")
+    graph.add_conditional_edges(
+        "hypothesis_generator",
+        route_after_generation,
+        ["hypothesis_validator", END],
+    )
     graph.add_conditional_edges(
         "hypothesis_validator",
         route_after_validation,
