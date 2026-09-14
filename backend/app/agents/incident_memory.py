@@ -6,17 +6,11 @@ from __future__ import annotations
 
 import logging
 
-from app.embeddings import get_embedder
+from app.embeddings import get_embedder, incident_embedding_text
 from app.models.state import IncidentState, SimilarIncident
 from app.tools.vector_store_client import query_similar_incidents
 
 logger = logging.getLogger(__name__)
-
-
-def _build_query_text(state: IncidentState) -> str:
-    evidence_lines = "\n".join(f"- ({e.source}) {e.claim}" for e in state.evidence)
-    hypothesis = state.accepted_hypothesis.description if state.accepted_hypothesis else ""
-    return f"{hypothesis}\n{evidence_lines}"
 
 
 def incident_memory_node(state: IncidentState, embed=None, query_fn=None) -> dict:
@@ -25,7 +19,7 @@ def incident_memory_node(state: IncidentState, embed=None, query_fn=None) -> dic
     alert_type = state.alert_payload.get("alert_type", "unknown")
 
     try:
-        embedding = embed(_build_query_text(state))
+        embedding = embed(incident_embedding_text(state))
         rows = query_fn(embedding, state.service_name, alert_type)
     except Exception:
         logger.exception("Incident Memory: retrieval failed for incident %s", state.incident_id)
