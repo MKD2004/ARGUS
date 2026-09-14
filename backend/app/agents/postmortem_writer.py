@@ -1,0 +1,137 @@
+"""Postmortem Writer — builds the postmortem from the structured state and
+posts it as a comment on the PR or issue (AGENTS.md, PIPELINE.md §13).
+
+A template, not a model (DECISIONS.md D-040): every sentence comes straight
+from state, so the postmortem can't misstate the evidence. Always runs, on
+every path (ARCHITECTURE.md §5).
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+
+from app.agents.human_gate import approval_allowed
+from app.agents.incident_report import evidence_section, root_cause_title, ruled_out_section
+from app.config import GITHUB_REPO, GITHUB_TOKEN
+from app.models.state import IncidentState
+from app.tools.github_client import add_comment
+
+logger = logging.getLogger(__name__)
+
+
+def _as_utc(moment: datetime) -> datetime:
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
+def _resolution(state: IncidentState) -> list[str]:
+    decided = f"by **{state.human_decision_by}** at {state.human_decision_at.isoformat()}"
+    if state.human_decision == "approved":
+        outcome = f"Fix approved {decided}."
+        link = (
+            f"Pull request: {state.github_pr_url}"
+            if state.github_pr_url
+            else "No pull request link was recorded: creation failed or GitHub isn't configured. Check the backend logs."
+        )
+    else:
+        outcome = f"Rejected {decided}."
+        link = (
+            f"Issue for manual follow-up: {state.github_issue_url}"
+            if state.github_issue_url
+            else "No issue link was recorded: creation failed or GitHub isn't configured. Check the backend logs."
+        )
+    return [f"- {outcome}", f"- {link}"]
+
+
+def _follow_ups(state: IncidentState) -> list[str]:
+    allowed, reason = approval_allowed(state)
+    items = []
+    if state.human_decision == "approved" and state.github_pr_url:
+        items.append("Review and merge the pull request, then confirm the service has recovered.")
+    elif allowed:
+        items.append("Decide on a fix manually; the tested patch was not accepted.")
+    else:
+        items.append(f"Investigate manually: {reason}")
+    if state.accepted_hypothesis is None:
+        items.append("Consider what evidence would have identified the root cause, and add it to the investigation.")
+    if not state.github_pr_url and not state.github_issue_url:
+        items.append("Record this incident in the tracker manually; Argus could not open a PR or issue.")
+    return [f"- [ ] {item}" for item in items]
+
+
+def build_postmortem(state: IncidentState, now: datetime | None = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    triggered = _as_utc(state.triggered_at)
+    minutes = max((now - triggered).total_seconds() / 60, 0)
+
+    timeline = [(triggered, f"Alert received ({state.alert_payload.get('alert_type', 'unknown')})")]
+    timeline += [(_as_utc(e.timestamp), f"({e.source}) {e.claim}") for e in state.evidence]
+    if state.human_decision_at:
+        timeline.append((_as_utc(state.human_decision_at), f"Human decision: {state.human_decision}"))
+    timeline.sort(key=lambda entry: entry[0])
+
+    similar = [
+        f"- {s.incident_id} ({s.similarity_score:.0%} similar): {s.summary}. Fix: {s.fix_applied}. "
+        f"Recovered in {s.recovery_time_minutes:g} minutes."
+        for s in state.similar_incidents
+    ] or ["- None found."]
+
+    strategies = [
+        f"{s.rank}. {s.description} (tradeoffs: {s.tradeoffs})"
+        + (" **chosen**" if state.chosen_fix_strategy and s.id == state.chosen_fix_strategy.id else "")
+        for s in state.candidate_fix_strategies
+    ] or ["No fix strategies were proposed."]
+
+    attempts = [
+        f"- Attempt {p.attempt_number}: **{p.test_result}**"
+        + (f". {p.failure_traceback.strip().splitlines()[0]}" if p.failure_traceback else "")
+        for p in state.patches
+    ] or ["- No patch was generated."]
+
+    sections = [
+        f"# Postmortem: {root_cause_title(state)}",
+        "\n".join(
+            [
+                f"- **Incident:** `{state.incident_id}`",
+                f"- **Service:** `{state.service_name}`",
+                f"- **Triggered:** {triggered.isoformat()}",
+                f"- **Time to resolution by Argus:** {minutes:.1f} minutes",
+            ]
+        ),
+        "## Timeline",
+        "\n".join(f"- {moment.isoformat()} {text}" for moment, text in timeline),
+        "## Root cause and evidence",
+        evidence_section(state),
+        "## Hypotheses ruled out",
+        ruled_out_section(state.rejected_hypotheses),
+        "## Similar past incidents",
+        "\n".join(similar),
+        "## Fix strategies considered",
+        "\n".join(strategies),
+        "## Patch attempts",
+        "\n".join(attempts),
+        "## Resolution",
+        "\n".join(_resolution(state)),
+        "## Follow-ups",
+        "\n".join(_follow_ups(state)),
+        "_Generated by Argus from the incident's recorded state (DECISIONS.md D-040)._",
+    ]
+    return "\n\n".join(sections)
+
+
+def postmortem_writer_node(state: IncidentState, comment_fn=None) -> dict:
+    comment_fn = comment_fn or add_comment
+    postmortem = build_postmortem(state)
+    target_url = state.github_pr_url or state.github_issue_url
+
+    if target_url and "/" in GITHUB_REPO:
+        owner, repo = GITHUB_REPO.split("/", 1)
+        try:
+            comment_fn(owner, repo, issue_url=target_url, body=postmortem, token=GITHUB_TOKEN)
+        except Exception:
+            # The postmortem is still in state; only the comment is lost (D-042).
+            logger.exception("Postmortem Writer: could not post the postmortem on %s", target_url)
+    else:
+        logger.info("Postmortem Writer: no PR or issue for incident %s, postmortem kept in state only", state.incident_id)
+
+    return {"postmortem": postmortem, "status": "notifying"}
