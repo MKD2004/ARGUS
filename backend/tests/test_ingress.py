@@ -1,10 +1,11 @@
-"""Tests for the incident endpoints: ingress (PIPELINE.md §1), lookup, and the
-human decision (PIPELINE.md §11, DECISIONS.md D-037/D-038).
+"""Tests for the incident endpoints: ingress (PIPELINE.md §1), lookup, approval
+status, the human decision (PIPELINE.md §11, DECISIONS.md D-037/D-038/D-045),
+and the scenario list (D-048).
 
-The graph is replaced by a stand-in so these tests cover the HTTP contract —
-status codes, what gets recorded, whether the run is resumed — without any
-external service or LLM (TESTING_STRATEGY.md §3). The real graph's pause and
-resume are covered in test_graph.py and test_human_gate.py.
+The graph and the background runner are replaced by stand-ins, so these tests
+cover the HTTP contract — status codes, what gets recorded, whether a run is
+started or resumed — without any external service or LLM (TESTING_STRATEGY.md §3).
+Real runs, streaming, and the WebSocket are in test_live_progress.py.
 """
 
 from datetime import datetime, timezone
@@ -13,23 +14,22 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from app.graph import HUMAN_GATE, run_config
-from app.main import _graph, app
+from app.events import EventBus
+from app.graph import HUMAN_GATE
+from app.main import Runtime, _runtime, app
 from app.models.alert import AlertRequest
 from app.models.state import Hypothesis, IncidentState, Patch
+from app.scenarios import SCENARIOS
 
 client = TestClient(app)
 
 
 class _FakeGraph:
-    """Stand-in for the compiled graph: remembers one incident's state and
-    records every call, so a test can assert on exactly what an endpoint did.
-    """
+    """Remembers one incident's state and records every write."""
 
     def __init__(self, state: IncidentState | None = None, next_nodes: tuple = ()):
         self.values = state.model_dump() if state else {}
         self.next = next_nodes
-        self.invocations: list[tuple] = []
         self.updates: list[dict] = []
 
     def get_state(self, config):
@@ -39,18 +39,31 @@ class _FakeGraph:
         self.updates.append(update)
         self.values = {**self.values, **update}
 
-    def invoke(self, state, config=None):
-        self.invocations.append((state, config))
-        if state is not None:
-            self.values = state.model_dump()
-            self.next = (HUMAN_GATE,)
-        return self.values
+
+class _FakeRunner:
+    def __init__(self, running: bool = False):
+        self.running = running
+        self.started: list[IncidentState] = []
+        self.resumed: list[IncidentState] = []
+
+    def is_running(self, incident_id):
+        return self.running
+
+    def start(self, state):
+        self.started.append(state)
+
+    def resume(self, state):
+        self.resumed.append(state)
 
 
-def _with_graph(graph):
-    """Patch the endpoint's graph for the duration of a `with` block."""
-    _graph.cache_clear()
-    return patch("app.main.build_graph", return_value=graph)
+def _use(graph: _FakeGraph, runner: _FakeRunner | None = None, bus: EventBus | None = None):
+    runtime = Runtime(graph=graph, bus=bus or EventBus(), runner=runner or _FakeRunner())
+    _runtime.cache_clear()
+    return runtime, patch("app.main.build_runtime", return_value=runtime)
+
+
+def teardown_function():
+    _runtime.cache_clear()
 
 
 def _paused_state(passing_patch: bool = True, accepted: bool = True) -> IncidentState:
@@ -77,10 +90,6 @@ def _paused_state(passing_patch: bool = True, accepted: bool = True) -> Incident
     )
 
 
-def teardown_function():
-    _graph.cache_clear()
-
-
 # --- POST /incidents --------------------------------------------------------
 
 
@@ -88,30 +97,34 @@ def test_health_still_ok():
     assert client.get("/health").json() == {"status": "ok"}
 
 
-def test_post_incident_runs_the_graph_to_the_gate():
-    graph = _FakeGraph()
-    with _with_graph(graph):
+def test_post_incident_starts_a_background_run_and_returns_at_once():
+    runtime, patched = _use(_FakeGraph())
+    with patched:
         response = client.post("/incidents", json={"service_name": "payments", "alert_type": "high_latency"})
 
-    assert response.status_code == 201
+    assert response.status_code == 202
     body = response.json()
     assert body["service_name"] == "payments"
     assert body["alert_payload"]["alert_type"] == "high_latency"
-    assert len(graph.invocations) == 1
-    state, config = graph.invocations[0]
-    # The incident id is the checkpoint thread, and the step limit comes from
-    # the incident's own loop bounds (D-031, D-037).
-    assert config == run_config(state)
-    assert config["configurable"]["thread_id"] == state.incident_id
+    assert body["status"] == "investigating"
+    assert [s.incident_id for s in runtime.runner.started] == [body["incident_id"]]
 
 
 def test_post_incident_with_an_existing_id_is_refused():
-    graph = _FakeGraph(_paused_state(), next_nodes=(HUMAN_GATE,))
-    with _with_graph(graph):
+    runtime, patched = _use(_FakeGraph(_paused_state(), next_nodes=(HUMAN_GATE,)))
+    with patched:
         response = client.post("/incidents", json={"service_name": "payments", "incident_id": "inc-42"})
 
     assert response.status_code == 409
-    assert graph.invocations == []
+    assert runtime.runner.started == []
+
+
+def test_post_incident_refuses_an_id_that_is_still_starting():
+    """The checkpoint may not exist yet in the first moments of a run."""
+    runtime, patched = _use(_FakeGraph(), runner=_FakeRunner(running=True))
+    with patched:
+        response = client.post("/incidents", json={"service_name": "payments", "incident_id": "inc-42"})
+    assert response.status_code == 409
 
 
 def test_incident_id_is_generated_when_not_supplied():
@@ -168,11 +181,12 @@ def test_missing_service_name_is_rejected():
     assert client.post("/incidents", json={"alert_type": "high_latency"}).status_code == 422
 
 
-# --- GET /incidents/{id} ----------------------------------------------------
+# --- GET /incidents/{id} and /approval ---------------------------------------
 
 
 def test_get_incident_returns_current_state():
-    with _with_graph(_FakeGraph(_paused_state(), next_nodes=(HUMAN_GATE,))):
+    _, patched = _use(_FakeGraph(_paused_state(), next_nodes=(HUMAN_GATE,)))
+    with patched:
         response = client.get("/incidents/inc-42")
 
     assert response.status_code == 200
@@ -180,76 +194,129 @@ def test_get_incident_returns_current_state():
 
 
 def test_get_unknown_incident_is_404():
-    with _with_graph(_FakeGraph()):
+    _, patched = _use(_FakeGraph())
+    with patched:
         assert client.get("/incidents/nope").status_code == 404
+        assert client.get("/incidents/nope/approval").status_code == 404
+
+
+def test_approval_status_for_a_paused_incident_with_a_passing_patch():
+    _, patched = _use(_FakeGraph(_paused_state(), next_nodes=(HUMAN_GATE,)))
+    with patched:
+        body = client.get("/incidents/inc-42/approval").json()
+    assert body["waiting_for_decision"] is True
+    assert body["approval_allowed"] is True
+
+
+def test_approval_status_explains_why_approval_is_not_allowed():
+    _, patched = _use(_FakeGraph(_paused_state(passing_patch=False), next_nodes=(HUMAN_GATE,)))
+    with patched:
+        body = client.get("/incidents/inc-42/approval").json()
+    assert body["waiting_for_decision"] is True
+    assert body["approval_allowed"] is False
+    assert "did not pass its tests" in body["reason"]
+
+
+def test_approval_is_never_offered_while_a_run_is_in_progress():
+    _, patched = _use(_FakeGraph(_paused_state(), next_nodes=(HUMAN_GATE,)), runner=_FakeRunner(running=True))
+    with patched:
+        body = client.get("/incidents/inc-42/approval").json()
+    assert body["waiting_for_decision"] is False
+    assert body["approval_allowed"] is False
 
 
 # --- POST /incidents/{id}/decision ------------------------------------------
 
 
-def _decide(graph, decision="approved", decided_by="oncall@example.com", incident_id="inc-42"):
-    with _with_graph(graph):
+def _decide(runtime_and_patch, decision="approved", decided_by="oncall@example.com", incident_id="inc-42"):
+    _, patched = runtime_and_patch
+    with patched:
         return client.post(f"/incidents/{incident_id}/decision", json={"decision": decision, "decided_by": decided_by})
 
 
-def test_approval_records_the_decision_and_resumes_the_run():
-    graph = _FakeGraph(_paused_state(), next_nodes=(HUMAN_GATE,))
-    response = _decide(graph)
+def test_approval_records_the_decision_and_resumes_in_the_background():
+    runtime_and_patch = _use(_FakeGraph(_paused_state(), next_nodes=(HUMAN_GATE,)))
+    runtime, _ = runtime_and_patch
+    response = _decide(runtime_and_patch)
 
-    assert response.status_code == 200
-    assert len(graph.updates) == 1
-    update = graph.updates[0]
+    assert response.status_code == 202
+    assert response.json()["human_decision"] == "approved"
+    assert len(runtime.graph.updates) == 1
+    update = runtime.graph.updates[0]
     assert update["human_decision"] == "approved"
     assert update["human_decision_by"] == "oncall@example.com"
     assert update["human_decision_at"] is not None
-    # Resumed from the pause, not restarted.
-    assert [state for state, _ in graph.invocations] == [None]
+    assert [s.human_decision for s in runtime.runner.resumed] == ["approved"]
 
 
 def test_rejection_is_always_allowed_even_without_a_diagnosis():
-    graph = _FakeGraph(_paused_state(accepted=False), next_nodes=(HUMAN_GATE,))
-    response = _decide(graph, decision="rejected")
+    runtime_and_patch = _use(_FakeGraph(_paused_state(accepted=False), next_nodes=(HUMAN_GATE,)))
+    response = _decide(runtime_and_patch, decision="rejected")
 
-    assert response.status_code == 200
-    assert graph.updates[0]["human_decision"] == "rejected"
+    assert response.status_code == 202
+    assert runtime_and_patch[0].graph.updates[0]["human_decision"] == "rejected"
 
 
 def test_approving_a_failing_patch_is_refused_before_anything_is_recorded():
     """D-038, check 1 of 4: the endpoint refuses, records nothing, resumes nothing."""
-    graph = _FakeGraph(_paused_state(passing_patch=False), next_nodes=(HUMAN_GATE,))
-    response = _decide(graph)
+    runtime_and_patch = _use(_FakeGraph(_paused_state(passing_patch=False), next_nodes=(HUMAN_GATE,)))
+    runtime, _ = runtime_and_patch
+    response = _decide(runtime_and_patch)
 
     assert response.status_code == 409
     assert "did not pass its tests" in response.json()["detail"]
-    assert graph.updates == []
-    assert graph.invocations == []
+    assert runtime.graph.updates == []
+    assert runtime.runner.resumed == []
 
 
 def test_approving_with_no_diagnosis_is_refused():
-    graph = _FakeGraph(_paused_state(accepted=False), next_nodes=(HUMAN_GATE,))
-    response = _decide(graph)
+    runtime_and_patch = _use(_FakeGraph(_paused_state(accepted=False), next_nodes=(HUMAN_GATE,)))
+    response = _decide(runtime_and_patch)
 
     assert response.status_code == 409
     assert "No root cause was accepted" in response.json()["detail"]
-    assert graph.updates == []
+    assert runtime_and_patch[0].graph.updates == []
 
 
 def test_decision_on_unknown_incident_is_404():
-    assert _decide(_FakeGraph(), incident_id="nope").status_code == 404
+    assert _decide(_use(_FakeGraph()), incident_id="nope").status_code == 404
 
 
 def test_decision_on_an_incident_not_at_the_gate_is_409():
     """A finished incident (nothing next) can't be decided again: no second PR."""
-    graph = _FakeGraph(_paused_state(), next_nodes=())
-    response = _decide(graph)
+    runtime_and_patch = _use(_FakeGraph(_paused_state(), next_nodes=()))
+    response = _decide(runtime_and_patch)
 
     assert response.status_code == 409
-    assert graph.updates == []
-    assert graph.invocations == []
+    assert runtime_and_patch[0].graph.updates == []
+    assert runtime_and_patch[0].runner.resumed == []
+
+
+def test_decision_while_the_run_is_still_going_is_409():
+    runtime_and_patch = _use(_FakeGraph(_paused_state(), next_nodes=(HUMAN_GATE,)), runner=_FakeRunner(running=True))
+    assert _decide(runtime_and_patch).status_code == 409
+    assert runtime_and_patch[0].graph.updates == []
 
 
 def test_decision_needs_a_known_decision_and_a_name():
-    graph = _FakeGraph(_paused_state(), next_nodes=(HUMAN_GATE,))
-    assert _decide(graph, decision="maybe").status_code == 422
-    assert _decide(graph, decided_by="").status_code == 422
-    assert graph.updates == []
+    runtime_and_patch = _use(_FakeGraph(_paused_state(), next_nodes=(HUMAN_GATE,)))
+    assert _decide(runtime_and_patch, decision="maybe").status_code == 422
+    assert _decide(runtime_and_patch, decided_by="").status_code == 422
+    assert runtime_and_patch[0].graph.updates == []
+
+
+# --- GET /scenarios ---------------------------------------------------------
+
+
+def test_scenarios_list_every_fault_from_the_demo_doc():
+    body = client.get("/scenarios").json()
+    assert [s["id"] for s in body] == [s.id for s in SCENARIOS]
+    assert len(body) == 7
+    redis = body[0]
+    assert redis == {
+        "id": "redis_exhaustion",
+        "label": "Redis connection exhaustion",
+        "service_name": "payments",
+        "alert_type": "high_latency",
+        "expected_root_cause": "Redis connection pool exhausted",
+    }
