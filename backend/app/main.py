@@ -7,6 +7,7 @@ the human approval endpoint (PIPELINE.md §11), and live progress for the dashbo
 - `POST /incidents/{id}/decision` records a human decision and resumes the run.
 - `WS /ws/incidents/{id}` streams progress events, history first (D-046).
 - `GET /scenarios` lists the demo fault scenarios (D-048).
+- `POST /scenarios/{id}/inject` breaks the demo stack where the scenario is real, then investigates (D-052).
 
 The checkpointer and event history live in this process, so incidents don't
 survive a restart (D-037, D-046).
@@ -21,9 +22,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 
+import httpx
 from fastapi import FastAPI, HTTPException, WebSocket
 
 from app.agents.human_gate import approval_allowed
+from app.config import DEMO_PAYMENTS_URL, FAULT_WARMUP_SECONDS
 from app.events import EventBus
 from app.graph import HUMAN_GATE, build_graph
 from app.models.alert import AlertRequest
@@ -31,7 +34,7 @@ from app.models.decision import HumanDecisionRequest
 from app.models.events import ApprovalStatus
 from app.models.state import IncidentState
 from app.runner import IncidentRunner
-from app.scenarios import SCENARIOS, Scenario
+from app.scenarios import SCENARIOS, Scenario, scenario_by_id
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +85,44 @@ def health() -> dict[str, str]:
 @app.get("/scenarios", response_model=list[Scenario])
 def list_scenarios() -> list[Scenario]:
     return SCENARIOS
+
+
+def trigger_fault(scenario: Scenario) -> None:
+    """Break the demo stack for a real scenario (D-052). Raises httpx.HTTPError if unreachable."""
+    if scenario.id == "redis_exhaustion":
+        response = httpx.post(f"{DEMO_PAYMENTS_URL.rstrip('/')}/fault/traffic-spike", timeout=5.0)
+        response.raise_for_status()
+
+
+@app.post("/scenarios/{scenario_id}/inject", response_model=IncidentState, status_code=202)
+def inject_scenario(scenario_id: str) -> IncidentState:
+    """Inject a demo scenario and start investigating it.
+
+    For a real scenario the fault is triggered first, and the investigation
+    starts after FAULT_WARMUP_SECONDS so its logs and metrics exist when the
+    agents look. If the demo stack can't be reached, nothing is created (502).
+    """
+    scenario = scenario_by_id(scenario_id)
+    if scenario is None:
+        raise HTTPException(status_code=404, detail=f"No scenario {scenario_id}")
+
+    delay = 0.0
+    if scenario.injects_fault:
+        try:
+            trigger_fault(scenario)
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not break the demo stack for '{scenario.label}': {exc}. Is demo-env running?",
+            ) from exc
+        delay = FAULT_WARMUP_SECONDS
+
+    state = AlertRequest(
+        service_name=scenario.service_name, alert_type=scenario.alert_type, extra={"scenario": scenario.id}
+    ).to_incident_state()
+    logger.info("Inject: %s for %s (investigation starts in %ss)", scenario.id, state.incident_id, delay)
+    _runtime().runner.start(state, delay_seconds=delay)
+    return state
 
 
 @app.post("/incidents", response_model=IncidentState, status_code=202)
