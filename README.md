@@ -69,7 +69,14 @@ Backend health check: `http://localhost:8000/health`. Demo stack services are on
 
 ### The dashboard
 
-Open `http://localhost:5173`. In development the Vite server forwards `/api` and `/ws` to the backend on port 8000 (set `ARGUS_BACKEND_URL` to point elsewhere). Pick a scenario and click **Inject failure**. The pipeline, evidence, hypotheses, and patch attempts update live, and when the run pauses you approve or reject from the page. For now "Inject failure" raises the scenario's alert but doesn't break anything in the demo stack; that's Phase 7.
+Open `http://localhost:5173`. In development the Vite server forwards `/api` and `/ws` to the backend on port 8000 (set `ARGUS_BACKEND_URL` to point elsewhere). Pick a scenario and click **Inject failure**. The pipeline, evidence, hypotheses, and patch attempts update live, and when the run pauses you approve or reject from the page.
+
+**Redis connection exhaustion is a real fault.** It starts a traffic spike that exhausts the payments service's Redis connection pool (pool size 10, below its peak of 30 concurrent checkouts), so Argus investigates real timeout logs and pool metrics. A correct fix has to pass the payments service's real capacity test in the sandbox. The other scenarios only raise their alert. The real scenario needs only part of the demo stack:
+
+```bash
+cd demo-env
+docker compose up -d --build payments prometheus loki promtail
+```
 
 ### The API directly
 
@@ -114,4 +121,4 @@ Generated patches are tested in a throwaway copy of the service with `git apply`
 
 The dashboard follows each incident over a WebSocket: pipeline progress, the Evidence Engine panel with its reasoning chain, hypotheses ruled out and why, patch attempts with the diff, and the approve/reject decision.
 
-Not built yet: the demo environment's fault injection (the dashboard's "Inject failure" raises the alert but doesn't break anything yet). The demo services are currently health-check stubs with no tests, so a real patch against them cannot pass yet. Incidents and their progress history are held in memory and are lost if the backend restarts.
+Demo readiness (Phase 7): Redis connection exhaustion is a real, end-to-end scenario; the other six still only raise their alert. The demo services are currently health-check stubs with no tests, so a real patch against them cannot pass yet. Incidents and their progress history are held in memory and are lost if the backend restarts.
