@@ -1,8 +1,8 @@
 """The demo fault scenarios from DEMO_ENVIRONMENT.md §3, defined once.
 
-The dashboard's "Inject Failure" control lists these and raises the chosen
-one's alert. Nothing here breaks the demo stack yet; the controller that does
-is Phase 7 (DECISIONS.md D-048).
+The dashboard's "Inject Failure" control lists these. Redis connection
+exhaustion breaks the payments service for real (DECISIONS.md D-050, D-052);
+the others only raise their alert (D-048).
 """
 
 from __future__ import annotations
@@ -16,6 +16,8 @@ class Scenario(BaseModel):
     service_name: str
     alert_type: str
     expected_root_cause: str
+    # True when injecting it breaks the demo stack for real, not just raises the alert.
+    injects_fault: bool = False
 
 
 # Service and alert type for database latency, bad deployment, and wrong env var
@@ -27,6 +29,7 @@ SCENARIOS: list[Scenario] = [
         service_name="payments",
         alert_type="high_latency",
         expected_root_cause="Redis connection pool exhausted",
+        injects_fault=True,
     ),
     Scenario(
         id="database_latency",
@@ -71,3 +74,7 @@ SCENARIOS: list[Scenario] = [
         expected_root_cause="Config-driven failure, not code or infra",
     ),
 ]
+
+
+def scenario_by_id(scenario_id: str) -> Scenario | None:
+    return next((s for s in SCENARIOS if s.id == scenario_id), None)
