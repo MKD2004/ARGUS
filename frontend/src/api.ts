@@ -34,15 +34,10 @@ export function listScenarios(): Promise<Scenario[]> {
   return request('/scenarios')
 }
 
+// Breaks the demo stack first where the scenario is real, then starts the
+// investigation; a 502 means the demo stack isn't reachable (D-052).
 export function injectScenario(scenario: Scenario): Promise<IncidentState> {
-  return request('/incidents', {
-    method: 'POST',
-    body: JSON.stringify({
-      service_name: scenario.service_name,
-      alert_type: scenario.alert_type,
-      extra: { scenario: scenario.id },
-    }),
-  })
+  return request(`/scenarios/${encodeURIComponent(scenario.id)}/inject`, { method: 'POST' })
 }
 
 export function getIncident(incidentId: string): Promise<IncidentState> {
