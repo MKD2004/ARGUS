@@ -109,6 +109,8 @@ export interface Scenario {
   service_name: string
   alert_type: string
   expected_root_cause: string
+  // True when injecting it breaks the demo stack for real (DECISIONS.md D-052).
+  injects_fault: boolean
 }
 
 export interface ApprovalStatus {
