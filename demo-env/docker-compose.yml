@@ -13,10 +13,10 @@ services:
     build: ./services/payments
     ports:
       - "8003:8000"
+    # Only Redis: payments never used the demo Postgres, and leaving it out
+    # lets the Redis scenario run with fewer containers (DECISIONS.md D-052).
     depends_on:
       redis:
-        condition: service_healthy
-      postgres:
         condition: service_healthy
 
   inventory:
