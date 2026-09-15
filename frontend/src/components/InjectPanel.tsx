@@ -7,9 +7,9 @@ interface Props {
   onStarted: (incidentId: string) => void
 }
 
-// "Inject Failure" demo control. For now it raises the scenario's alert only;
-// breaking the demo stack for real is Phase 7 (DECISIONS.md D-048), and the
-// control says so rather than implying otherwise.
+// "Inject Failure" demo control. Scenarios marked `injects_fault` break the demo
+// stack for real; the rest only raise their alert (DECISIONS.md D-048, D-052).
+// The control says which, rather than implying every one is real.
 export function InjectPanel({ onStarted }: Props) {
   const [scenarios, setScenarios] = useState<Scenario[]>([])
   const [selectedId, setSelectedId] = useState('')
@@ -50,6 +50,7 @@ export function InjectPanel({ onStarted }: Props) {
           {scenarios.map((scenario) => (
             <option key={scenario.id} value={scenario.id}>
               {scenario.label}
+              {scenario.injects_fault ? ' (real fault)' : ' (alert only)'}
             </option>
           ))}
         </select>
@@ -70,8 +71,9 @@ export function InjectPanel({ onStarted }: Props) {
         {busy ? 'Starting…' : 'Inject failure'}
       </button>
       <p className="note">
-        Raises this scenario's alert and starts an investigation. It doesn't break the demo stack yet; that arrives
-        in Phase 7.
+        {selected?.injects_fault
+          ? 'Real fault: starts a traffic spike that exhausts the service’s Redis pool, then begins investigating about 25 seconds later, once the failure shows up in logs and metrics. Needs the demo stack running.'
+          : 'Alert only: raises this scenario’s alert and starts an investigation, but doesn’t break anything in the demo stack.'}
       </p>
       {error && <p className="error" role="alert">{error}</p>}
     </section>
