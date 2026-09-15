@@ -34,6 +34,34 @@ def test_query_logs_parses_streams_into_entries():
     assert isinstance(entries[0]["timestamp"], datetime)
 
 
+def test_query_logs_asks_loki_only_for_problem_lines():
+    """D-051: routine lines (like /metrics polling) must not bury the errors."""
+    seen = {}
+    query_logs(
+        "payments",
+        datetime.now(timezone.utc),
+        datetime.now(timezone.utc),
+        "http://loki:3100",
+        fetch=lambda url, params: seen.update(params) or {"data": {"result": []}},
+    )
+    assert seen["query"].startswith('{container=~".*payments.*"} |~ "(?i)(error|warn|timeout')
+    assert seen["limit"] == 200
+
+
+def test_query_metrics_asks_for_each_default_metric_filtered_by_service():
+    queries = []
+    query_metrics(
+        "payments",
+        datetime.now(timezone.utc),
+        datetime.now(timezone.utc),
+        "http://prometheus:9090",
+        fetch=lambda url, params: queries.append(params["query"]) or {"data": {"result": []}},
+    )
+    assert 'redis_pool_in_use{service="payments"}' in queries
+    assert 'redis_pool_timeouts_total{service="payments"}' in queries
+    assert all(q.endswith('{service="payments"}') for q in queries)
+
+
 def test_query_metrics_parses_matrix_into_series():
     fixture = _load("prometheus_response.json")
     series_list = query_metrics(
@@ -42,6 +70,7 @@ def test_query_metrics_parses_matrix_into_series():
         datetime.now(timezone.utc),
         "http://prometheus:9090",
         fetch=lambda url, params: fixture,
+        queries=["stub_requests_total"],
     )
     assert len(series_list) == 1
     series = series_list[0]
