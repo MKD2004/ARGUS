@@ -51,3 +51,9 @@ OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
 OLLAMA_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "300"))
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
+
+# Real fault injection for the demo (DECISIONS.md D-052): where the payments
+# service's fault controller listens, and how long to let a fault show up in
+# logs and metrics before investigating it.
+DEMO_PAYMENTS_URL = os.environ.get("DEMO_PAYMENTS_URL", "http://localhost:8003")
+FAULT_WARMUP_SECONDS = float(os.environ.get("FAULT_WARMUP_SECONDS", "25"))
