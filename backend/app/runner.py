@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from concurrent.futures import Executor, ThreadPoolExecutor
 
 from app.agents.human_gate import approval_allowed
@@ -29,21 +30,28 @@ class IncidentRunner:
         with self._lock:
             return incident_id in self._running
 
-    def start(self, state: IncidentState) -> None:
-        """Run a new incident until it pauses at the human gate."""
-        self._submit(state.incident_id, state, state)
+    def start(self, state: IncidentState, delay_seconds: float = 0) -> None:
+        """Run a new incident until it pauses at the human gate.
+
+        `delay_seconds` lets an injected fault show up in logs and metrics
+        before the agents look for it (D-052). The incident counts as running
+        during the delay, so it can't be started or decided twice.
+        """
+        self._submit(state.incident_id, state, state, delay_seconds)
 
     def resume(self, state: IncidentState) -> None:
         """Continue a paused incident after its decision has been recorded."""
         self._submit(state.incident_id, None, state)
 
-    def _submit(self, incident_id: str, graph_input: IncidentState | None, state: IncidentState) -> None:
+    def _submit(
+        self, incident_id: str, graph_input: IncidentState | None, state: IncidentState, delay_seconds: float = 0
+    ) -> None:
         with self._lock:
             if incident_id in self._running:
                 raise RuntimeError(f"incident {incident_id} is already running")
             self._running.add(incident_id)
         try:
-            self._executor.submit(self._run, incident_id, graph_input, run_config(state))
+            self._executor.submit(self._run, incident_id, graph_input, run_config(state), delay_seconds)
         except Exception:
             with self._lock:
                 self._running.discard(incident_id)
@@ -52,8 +60,10 @@ class IncidentRunner:
     def _publish(self, incident_id: str, **fields) -> None:
         self.bus.publish(ProgressEvent(incident_id=incident_id, **fields))
 
-    def _run(self, incident_id: str, graph_input: IncidentState | None, config: dict) -> None:
+    def _run(self, incident_id: str, graph_input: IncidentState | None, config: dict, delay_seconds: float = 0) -> None:
         try:
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
             # "updates" names each node as it finishes (the parallel agents one
             # at a time); "values" is the correct full state after each step.
             # get_state() lags mid-run, so it isn't used for live state (D-046).
