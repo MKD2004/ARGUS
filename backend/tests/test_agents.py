@@ -72,7 +72,7 @@ def test_metrics_agent_produces_tagged_evidence():
         result = metrics_agent_node(_stub_state())
     assert len(result["evidence"]) == 1
     assert result["evidence"][0].source == "metrics"
-    assert "42.0" in result["evidence"][0].claim
+    assert "stub_requests_total = 42 for payments" in result["evidence"][0].claim
 
 
 def test_metrics_agent_skips_series_with_no_values():
@@ -111,3 +111,42 @@ def test_evidence_collector_advances_status():
 def test_evidence_collector_advances_status_even_with_no_evidence():
     result = evidence_collector_node(_stub_state())
     assert result["status"] == "validating_hypothesis"
+
+
+def test_log_agent_groups_repeated_lines_with_count_and_time_range():
+    """D-051: one piece of evidence per distinct error, not one per occurrence."""
+    base = datetime(2026, 9, 15, 10, 32, 5, tzinfo=timezone.utc)
+    repeated = "ERROR payments: redis pool timeout: no free connection after 2s (pool size 10)"
+    entries = [{"timestamp": base.replace(second=5 + i), "line": repeated, "labels": {}} for i in range(3)]
+    entries.append({"timestamp": base, "line": "WARNING payments: slow checkout", "labels": {}})
+    with patch("app.agents.log_agent.query_logs", return_value=entries):
+        result = log_agent_node(_stub_state())
+
+    claims = [e.claim for e in result["evidence"]]
+    assert claims == [
+        f"{repeated} (x3 between 10:32:05 and 10:32:07 UTC)",
+        "WARNING payments: slow checkout",
+    ]
+    assert result["evidence"][0].timestamp == base.replace(second=5)
+
+
+def test_log_agent_keeps_at_most_ten_distinct_lines():
+    now = datetime.now(timezone.utc)
+    entries = [{"timestamp": now, "line": f"ERROR distinct problem {n}", "labels": {}} for n in range(15)]
+    with patch("app.agents.log_agent.query_logs", return_value=entries):
+        result = log_agent_node(_stub_state())
+    assert len(result["evidence"]) == 10
+
+
+def test_metrics_agent_reports_the_peak_when_it_differs_from_the_latest():
+    t0 = datetime(2026, 9, 15, 10, 32, tzinfo=timezone.utc)
+    series = [{
+        "metric": "redis_pool_in_use",
+        "labels": {},
+        "values": [(t0, 3.0), (t0.replace(minute=33), 10.0), (t0.replace(minute=35), 4.0)],
+    }]
+    with patch("app.agents.metrics_agent.query_metrics", return_value=series):
+        claim = metrics_agent_node(_stub_state())["evidence"][0].claim
+    assert claim == (
+        "redis_pool_in_use = 4 for payments at 2026-09-15T10:35:00+00:00 (peak 10 at 2026-09-15T10:33:00+00:00)"
+    )
