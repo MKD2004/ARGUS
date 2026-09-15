@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import httpx
 from fastapi.testclient import TestClient
 
 from app.events import EventBus
@@ -319,4 +320,71 @@ def test_scenarios_list_every_fault_from_the_demo_doc():
         "service_name": "payments",
         "alert_type": "high_latency",
         "expected_root_cause": "Redis connection pool exhausted",
+        "injects_fault": True,
     }
+    assert [s["id"] for s in body if s["injects_fault"]] == ["redis_exhaustion"]
+
+
+# --- POST /scenarios/{id}/inject (D-052) --------------------------------------
+
+
+class _DelayRecordingRunner(_FakeRunner):
+    def __init__(self):
+        super().__init__()
+        self.delays: list[float] = []
+
+    def start(self, state, delay_seconds=0):
+        self.started.append(state)
+        self.delays.append(delay_seconds)
+
+
+def test_inject_real_scenario_breaks_the_stack_then_investigates_after_warmup():
+    runtime, patched = _use(_FakeGraph(), runner=_DelayRecordingRunner())
+    with patched, patch("app.main.trigger_fault") as trigger, patch("app.main.FAULT_WARMUP_SECONDS", 25.0):
+        response = client.post("/scenarios/redis_exhaustion/inject")
+
+    assert response.status_code == 202
+    trigger.assert_called_once()
+    assert trigger.call_args.args[0].id == "redis_exhaustion"
+    body = response.json()
+    assert body["service_name"] == "payments"
+    assert body["alert_payload"]["scenario"] == "redis_exhaustion"
+    assert runtime.runner.delays == [25.0]
+
+
+def test_inject_alert_only_scenario_touches_nothing_and_starts_at_once():
+    runtime, patched = _use(_FakeGraph(), runner=_DelayRecordingRunner())
+    with patched, patch("app.main.trigger_fault") as trigger:
+        response = client.post("/scenarios/cpu_spike/inject")
+
+    assert response.status_code == 202
+    trigger.assert_not_called()
+    assert runtime.runner.delays == [0.0]
+
+
+def test_inject_when_the_demo_stack_is_down_creates_no_incident():
+    """Investigating a failure that never happened would make the demo dishonest."""
+    runtime, patched = _use(_FakeGraph(), runner=_DelayRecordingRunner())
+    refused = httpx.ConnectError("connection refused")
+    with patched, patch("app.main.trigger_fault", side_effect=refused):
+        response = client.post("/scenarios/redis_exhaustion/inject")
+
+    assert response.status_code == 502
+    assert "Is demo-env running?" in response.json()["detail"]
+    assert runtime.runner.started == []
+
+
+def test_inject_unknown_scenario_is_404():
+    _, patched = _use(_FakeGraph())
+    with patched:
+        assert client.post("/scenarios/nope/inject").status_code == 404
+
+
+def test_trigger_fault_posts_to_the_payments_fault_controller():
+    from app.main import trigger_fault
+    from app.scenarios import scenario_by_id
+
+    with patch("app.main.DEMO_PAYMENTS_URL", "http://payments.test:8003/"), patch("app.main.httpx.post") as post:
+        post.return_value = httpx.Response(200, request=httpx.Request("POST", "http://payments.test"))
+        trigger_fault(scenario_by_id("redis_exhaustion"))
+    post.assert_called_once_with("http://payments.test:8003/fault/traffic-spike", timeout=5.0)
