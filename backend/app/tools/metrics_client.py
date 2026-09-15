@@ -9,10 +9,15 @@ import httpx
 
 FetchFn = Callable[[str, dict], dict]
 
-# The demo-env stub services only expose the generic counter added in Phase 0;
-# real business metrics (CPU/memory/latency) arrive once fault-injection
-# scenarios are built (DEMO_ENVIRONMENT.md, later phase).
-DEFAULT_QUERIES = ["stub_requests_total"]
+# Metrics the demo services expose, each labelled with `service` (DECISIONS.md
+# D-051). The Redis pool metrics come from the payments service's real pool.
+DEFAULT_QUERIES = [
+    "redis_pool_size",
+    "redis_pool_in_use",
+    "redis_pool_timeouts_total",
+    "http_request_errors_total",
+    "stub_requests_total",
+]
 
 
 def _default_fetch(url: str, params: dict) -> dict:
