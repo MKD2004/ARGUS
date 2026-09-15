@@ -39,3 +39,15 @@ GITHUB_COMMIT_AUTHOR_EMAIL = os.environ.get("GITHUB_COMMIT_AUTHOR_EMAIL") or Non
 # Slack notifications (D-042). Both must be set, or the notifier skips.
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN") or None
 SLACK_CHANNEL = os.environ.get("SLACK_CHANNEL") or None
+
+# Model provider for the reasoning agents (DECISIONS.md D-049). Read here rather
+# than in llm.py so .env is always loaded first, whatever the import order.
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "ollama")
+# Chosen by benchmark on 2026-09-15 (scripts/llm_benchmark.py, D-049).
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "granite4.1:8b")
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+# Ollama reserves memory for the whole window up front: 16384 took qwen3:8b
+# from 5.2 GB to 7.9 GB and ran a 16 GB laptop out of memory (D-049).
+OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
+OLLAMA_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "300"))
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
