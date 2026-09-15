@@ -9,6 +9,12 @@ services:
       # Overrides .env's host-facing value: inside the Compose network Postgres
       # is reachable as `postgres`, not `localhost` (DECISIONS.md D-023).
       DATABASE_URL: postgresql://copilot:copilot@postgres:5432/copilot
+      # Ollama runs on the host, not in Compose; `localhost` inside the
+      # container is the container itself (DECISIONS.md D-049).
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+    extra_hosts:
+      # Makes host.docker.internal resolve on Linux too (Docker Desktop does it already).
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
