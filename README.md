@@ -17,7 +17,7 @@ The expensive part of an incident is rarely the fix — it's the investigation. 
 ## Stack
 
 - **Orchestration:** LangGraph (parallel branches, conditional routing, bounded retry loops, typed shared state) + FastAPI
-- **LLM:** Anthropic Claude via `langchain-anthropic`
+- **LLM:** a local model through Ollama by default (`granite4.1:8b`), or Anthropic Claude, chosen by the `LLM_PROVIDER` setting and reached through LangChain
 - **Data:** PostgreSQL + `pgvector` for incident similarity search
 - **Observability (demo environment):** Prometheus, Loki, Grafana
 - **Integrations:** GitHub API (deploy history, PRs, issues), Slack API (notifications)
@@ -34,12 +34,18 @@ demo-env/    Isolated demo microservices stack + Prometheus/Loki/Grafana, separa
 
 ## Running locally
 
-Requires Docker Desktop.
+Requires Docker Desktop and [Ollama](https://ollama.com).
+
+```bash
+ollama pull granite4.1:8b   # ~5.3 GB; the default model (see backend/scripts/llm_benchmark.py)
+```
+
+An 8B model needs about 6.6 GB of free memory while loaded, so on a 16 GB machine close other heavy apps first.
 
 ```bash
 # Argus's own services (API + Postgres/pgvector)
 cd backend
-cp .env.example .env   # fill in ANTHROPIC_API_KEY etc.
+cp .env.example .env   # defaults to local Ollama; add GITHUB_TOKEN etc. as needed
 docker compose up -d --build
 
 # Demo microservices stack (isolated from the above)
