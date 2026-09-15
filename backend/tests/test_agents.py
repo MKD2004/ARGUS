@@ -150,3 +150,43 @@ def test_metrics_agent_reports_the_peak_when_it_differs_from_the_latest():
     assert claim == (
         "redis_pool_in_use = 4 for payments at 2026-09-15T10:35:00+00:00 (peak 10 at 2026-09-15T10:33:00+00:00)"
     )
+
+# --- Investigation window ------------------------------------------------------
+
+
+def test_window_never_ends_in_the_future():
+    """D-051: an end past now made Prometheus return points stamped in the future."""
+    from app.agents.window import investigation_window
+
+    triggered = datetime(2026, 9, 15, 8, 20, 32, tzinfo=timezone.utc)
+    now = triggered.replace(second=50)
+    start, end = investigation_window(triggered, now=now)
+    assert start == triggered.replace(minute=5)
+    assert end == now
+
+
+def test_window_for_an_older_alert_still_ends_five_minutes_after_it():
+    from app.agents.window import investigation_window
+
+    triggered = datetime(2026, 9, 15, 8, 0, tzinfo=timezone.utc)
+    start, end = investigation_window(triggered, now=datetime(2026, 9, 15, 9, 0, tzinfo=timezone.utc))
+    assert (start, end) == (triggered.replace(hour=7, minute=45), triggered.replace(minute=5))
+
+
+def test_window_treats_a_timestamp_without_timezone_as_utc():
+    from app.agents.window import investigation_window
+
+    start, end = investigation_window(datetime(2026, 9, 15, 8, 0), now=datetime(2026, 9, 15, 9, 0, tzinfo=timezone.utc))
+    assert end == datetime(2026, 9, 15, 8, 5, tzinfo=timezone.utc)
+
+
+def test_metrics_agent_queries_prometheus_no_later_than_now():
+    captured = {}
+
+    def fake_query(service, start, end, url):
+        captured["end"] = end
+        return []
+
+    with patch("app.agents.metrics_agent.query_metrics", side_effect=fake_query):
+        metrics_agent_node(_stub_state(triggered_at=datetime.now(timezone.utc)))
+    assert captured["end"] <= datetime.now(timezone.utc)
