@@ -250,3 +250,20 @@ def test_websocket_delivers_events_published_after_it_connected():
             assert (second.seq, second.type) == (2, "finished")
     finally:
         _runtime.cache_clear()
+
+
+def test_runner_waits_before_starting_and_counts_as_running_meanwhile():
+    """D-052: an injected fault gets time to reach logs and metrics first."""
+    runtime = _runtime_inline()
+    state = _stub_state(incident_id="inc-delay")
+    slept = []
+
+    def fake_sleep(seconds):
+        slept.append(seconds)
+        assert runtime.runner.is_running("inc-delay")
+
+    with _investigation_stubs([_PASS]), patch("app.runner.time.sleep", fake_sleep):
+        runtime.runner.start(state, delay_seconds=25)
+
+    assert slept == [25]
+    assert runtime.bus.history("inc-delay")[-1].type == "paused"
